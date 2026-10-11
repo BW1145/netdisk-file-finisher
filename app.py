@@ -95,6 +95,8 @@ class App:
         selected = filedialog.askopenfilename(initialdir=self.folder.get(), title='选择下载临时文件',
                                               filetypes=[('下载临时文件', '*.downloading'), ('所有文件', '*.*')])
         if selected:
+            if not self.folder.get().strip():
+                self.folder.set(str(Path(selected).parent))
             if not self.output.get():
                 self.output.set(str(Path(selected).parent / '收尾导出'))
             self.start(Path(selected), unchecked)
