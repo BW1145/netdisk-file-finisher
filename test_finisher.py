@@ -232,18 +232,121 @@ class FinisherTests(unittest.TestCase):
         self.assertEqual(saved[0]['output'], result['output'])
 
     def test_history_write_failure_preserves_export_success(self):
-        original_write = Path.write_text
-        def write(path, *args, **kwargs):
-            if path.name == '处理记录.json':
-                raise PermissionError('history write denied')
-            return original_write(path, *args, **kwargs)
-        with patch.object(Path, 'write_text', write):
+        with patch.object(core.os, 'replace', side_effect=PermissionError('history write denied')):
             source, result = self.run_source(self.make_zip())
         self.assertEqual(result['status'], '已导出')
         self.assertEqual(Path(result['output']).read_bytes(), source.read_bytes())
         self.assertEqual(result['sha256'], hashlib.sha256(source.read_bytes()).hexdigest())
         self.assertIn('处理记录保存失败', result['detail'])
         self.assertFalse(list(self.out.rglob('*.处理中')))
+        self.assertFalse(list(self.out.glob('*.tmp')))
+
+    def test_history_atomic_write_replaces_complete_utf8_json(self):
+        self.out.mkdir()
+        history = self.out / '处理记录.json'
+        history.write_bytes(b'["old"]')
+        records = [{'name': '新记录', 'output': '导出文件/测试.zip'}]
+        original_replace = os.replace
+        original_fsync = os.fsync
+        synced = []
+
+        def sync(descriptor):
+            original_fsync(descriptor)
+            synced.append(True)
+
+        def replace(source, target):
+            self.assertEqual(Path(source).parent, history.parent)
+            self.assertEqual(Path(target), history)
+            self.assertEqual(history.read_bytes(), b'["old"]')
+            self.assertEqual(json.loads(Path(source).read_text(encoding='utf-8')), records)
+            self.assertTrue(synced)
+            original_replace(source, target)
+
+        with patch.object(core.os, 'fsync', sync), patch.object(core.os, 'replace', replace):
+            core.write_history(history, records)
+        self.assertEqual(json.loads(history.read_text(encoding='utf-8')), records)
+        self.assertIn('新记录'.encode('utf-8'), history.read_bytes())
+        self.assertEqual(list(self.out.iterdir()), [history])
+
+    def test_history_partial_write_failure_preserves_old_record_and_export(self):
+        source, first = self.run_source(self.make_zip())
+        history = self.out / '处理记录.json'
+        old = history.read_bytes()
+
+        def fail_write(records, stream, **kwargs):
+            stream.write('[{"name":')
+            stream.flush()
+            raise OSError('disk full')
+
+        with patch.object(core.json, 'dump', fail_write):
+            _, result = self.run_source(self.make_zip(), name='second.zip.downloading')
+        self.assertEqual(result['status'], '已导出')
+        self.assertIn('处理记录保存失败', result['detail'])
+        self.assertEqual(Path(result['output']).read_bytes(), source.read_bytes())
+        self.assertEqual(history.read_bytes(), old)
+        self.assertEqual(core.process(source, {}, self.out)['output'], first['output'])
+        self.assertFalse(list(self.out.glob('*.tmp')))
+
+    def test_history_flush_failure_preserves_old_record(self):
+        self.out.mkdir()
+        history = self.out / '处理记录.json'
+        history.write_bytes(b'["old"]')
+        original_temporary = tempfile.NamedTemporaryFile
+
+        def fail_flush():
+            raise OSError('flush failed')
+
+        def temporary(*args, **kwargs):
+            stream = original_temporary(*args, **kwargs)
+            stream.flush = fail_flush
+            return stream
+
+        with patch.object(core.tempfile, 'NamedTemporaryFile', temporary):
+            with self.assertRaisesRegex(OSError, 'flush failed'):
+                core.write_history(history, [{'name': 'new'}])
+        self.assertEqual(history.read_bytes(), b'["old"]')
+        self.assertEqual(list(self.out.iterdir()), [history])
+
+    def test_history_sync_and_replace_failures_preserve_old_record_and_export(self):
+        source, first = self.run_source(self.make_zip())
+        history = self.out / '处理记录.json'
+        old = history.read_bytes()
+        original_write_history = core.write_history
+        for operation in ('fsync', 'replace'):
+            with self.subTest(operation=operation):
+                def fail_save(path, records):
+                    with patch.object(core.os, operation, side_effect=OSError(operation + ' failed')):
+                        original_write_history(path, records)
+
+                with patch.object(core, 'write_history', fail_save):
+                    _, result = self.run_source(self.make_zip(), name=operation + '.zip.downloading')
+                self.assertEqual(result['status'], '已导出')
+                self.assertIn('处理记录保存失败', result['detail'])
+                self.assertEqual(Path(result['output']).read_bytes(), source.read_bytes())
+                self.assertEqual(history.read_bytes(), old)
+                self.assertFalse(list(self.out.glob('*.tmp')))
+                self.assertFalse(list(self.out.rglob('*.处理中')))
+        self.assertEqual(core.process(source, {}, self.out)['output'], first['output'])
+
+    def test_history_interrupt_preserves_old_record_and_cleans_temporary(self):
+        self.out.mkdir()
+        history = self.out / '处理记录.json'
+        history.write_bytes(b'["old"]')
+
+        def interrupt_write(records, stream, **kwargs):
+            stream.write('[{"name":')
+            stream.flush()
+            raise KeyboardInterrupt
+
+        for target, operation, failure in ((core.json, 'dump', interrupt_write),
+                                            (core.os, 'fsync', KeyboardInterrupt()),
+                                            (core.os, 'replace', KeyboardInterrupt())):
+            with self.subTest(operation=operation):
+                with patch.object(target, operation, side_effect=failure):
+                    with self.assertRaises(KeyboardInterrupt):
+                        core.write_history(history, [{'name': 'new'}])
+                self.assertEqual(history.read_bytes(), b'["old"]')
+                self.assertEqual(list(self.out.iterdir()), [history])
 
     def test_disabled_encrypted_export_requires_choice(self):
         data = bytearray(self.make_zip())

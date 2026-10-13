@@ -285,6 +285,22 @@ def validate_other_archive(path, cancel, notify):
                 proc.wait(timeout=10)
 
 
+def write_history(path, records):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                         prefix='.' + path.name + '-', suffix='.tmp',
+                                         dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(records, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def read_history(path):
     fields = {'identity': dict, 'name': str, 'output': str, 'detail': str,
               'sha256': str, 'export_size': int, 'export_mtime': int}
@@ -406,7 +422,7 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
                       export_mtime=target.stat().st_mtime_ns)
         previous.append(result)
         try:
-            records_file.write_text(json.dumps(previous, ensure_ascii=False, indent=2), encoding='utf-8')
+            write_history(records_file, previous)
         except OSError as error:
             result['detail'] += f'；处理记录保存失败：{error}。副本已导出，下次处理可能再次导出。'
         return result
