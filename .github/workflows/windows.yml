@@ -49,6 +49,9 @@ jobs:
       actions: read
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Download tested build
         env:
           GH_TOKEN: ${{ github.token }}
