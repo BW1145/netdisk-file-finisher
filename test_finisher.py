@@ -10,6 +10,7 @@ import threading
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import finisher_core as core
 
@@ -37,17 +38,83 @@ class FinisherTests(unittest.TestCase):
         path.write_bytes(data)
         return path, core.process(path, record or {}, self.out, **options)
 
-    def test_video_prefixed_zip_overrides_extension_and_wrong_hash(self):
+    def test_video_prefixed_zip_uses_full_source_checksum(self):
         zip_data = self.make_zip()
         cover = b'\x1aE\xdf\xa3-matroska-cover'
         path, result = self.run_source(cover + zip_data, '压缩包.mkv.downloading',
-                                       {'md5': 'f' * 32, 'status': 5, 'error_code': 1000022})
+                                       {'md5': hashlib.md5(cover + zip_data).hexdigest(),
+                                        'status': 5, 'error_code': 1000022})
         self.assertEqual(result['status'], '已导出')
         self.assertEqual(Path(result['output']).suffix, '.zip')
         self.assertEqual(Path(result['output']).read_bytes(), zip_data)
         self.assertEqual(path.read_bytes(), cover + zip_data)
         with zipfile.ZipFile(result['output']) as archive:
             self.assertIsNone(archive.testzip())
+
+    def test_zip_checksum_mismatch_is_rejected(self):
+        for data in (self.make_zip(), b'cover' + self.make_zip()):
+            with self.subTest(prefixed=data.startswith(b'cover')):
+                _, result = self.run_source(data, record={'md5': 'f' * 32})
+                self.assertEqual(result['status'], '需要检查')
+                self.assertFalse(result['output'])
+                self.assertFalse(self.out.exists())
+
+    def test_prefixed_zip_payload_checksum_does_not_match_source(self):
+        data = self.make_zip()
+        _, result = self.run_source(b'cover' + data, record={'md5': hashlib.md5(data).hexdigest()})
+        self.assertEqual(result['status'], '需要检查')
+        self.assertFalse(result['output'])
+
+    def test_zip_matching_checksum_is_exported(self):
+        data = self.make_zip()
+        _, result = self.run_source(data, record={'md5': hashlib.md5(data).hexdigest()})
+        self.assertEqual(result['status'], '已导出')
+        self.assertEqual(Path(result['output']).read_bytes(), data)
+
+    def test_zip_checksum_is_checked_against_copied_snapshot(self):
+        original = self.make_zip()
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr('目录/one.mp4', b'other-placeholder')
+        changed = stream.getvalue()
+        self.assertEqual(len(original), len(changed))
+        source = self.root / 'changed.zip.downloading'
+        source.write_bytes(original)
+        original_copy = core.copy_snapshot
+        def copy(*args, **kwargs):
+            source.write_bytes(changed)
+            return original_copy(*args, **kwargs)
+        with patch.object(core, 'copy_snapshot', copy):
+            result = core.process(source, {'md5': hashlib.md5(original).hexdigest()}, self.out)
+        self.assertEqual(result['status'], '需要检查')
+        self.assertFalse(result['output'])
+        self.assertFalse(list(self.out.rglob('*.zip')))
+        self.assertFalse(list(self.out.rglob('*.处理中')))
+
+    def test_active_zip_waits_even_with_complete_structure(self):
+        _, result = self.run_source(self.make_zip(), record={'status': 2})
+        self.assertEqual(result['status'], '等待下载停止')
+        self.assertFalse(self.out.exists())
+
+    def test_incomplete_zip_task_waits(self):
+        data = self.make_zip()
+        _, result = self.run_source(data, record={'status': 5, 'file_size': len(data),
+                                                'complete_size': len(data) - 1})
+        self.assertEqual(result['status'], '等待下载完成')
+        self.assertFalse(self.out.exists())
+
+    def test_zip_finalization_error_can_be_checked(self):
+        data = self.make_zip()
+        _, result = self.run_source(data, record={'status': 5, 'file_size': len(data),
+                                                'complete_size': len(data) - 1, 'error_code': 1000022})
+        self.assertEqual(result['status'], '已导出')
+
+    def test_active_zip_manual_copy_remains_unchecked(self):
+        _, result = self.run_source(self.make_zip(), record={'status': 2, 'md5': 'f' * 32},
+                                    unchecked=True)
+        self.assertEqual(result['status'], '已导出')
+        self.assertIn('未验证', result['detail'])
+        self.assertEqual(Path(result['output']).parent.name, '待核查副本')
 
     def test_zip_crc_error_is_not_exported_as_verified(self):
         damaged = bytearray(self.make_zip())
@@ -73,6 +140,54 @@ class FinisherTests(unittest.TestCase):
         self.assertEqual(second['status'], '已处理过')
         self.assertEqual(first['output'], second['output'])
 
+    def test_reuse_rechecks_export_with_unchanged_metadata(self):
+        data = self.make_zip()
+        for changed_identity in (False, True):
+            with self.subTest(changed_identity=changed_identity):
+                output = self.out / str(changed_identity)
+                source = self.root / 'reuse.downloading'
+                source.write_bytes(data)
+                first = core.process(source, {}, output)
+                target = Path(first['output'])
+                saved = target.stat()
+                target.write_bytes(b'x' * len(data))
+                os.utime(target, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+                if changed_identity:
+                    saved_source = source.stat()
+                    os.utime(source, ns=(saved_source.st_atime_ns, saved_source.st_mtime_ns + 1000000000))
+                second = core.process(source, {}, output)
+                self.assertEqual(second['status'], '已导出')
+                self.assertNotEqual(second['output'], first['output'])
+                self.assertEqual(Path(second['output']).read_bytes(), data)
+
+    def test_reuse_rechecks_source_with_unchanged_metadata(self):
+        source, first = self.run_source(self.make_zip(), unchecked=True)
+        saved = source.stat()
+        changed = bytearray(source.read_bytes())
+        changed[changed.index(b'video-placeholder')] ^= 1
+        source.write_bytes(changed)
+        os.utime(source, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+        second = core.process(source, {}, self.out, unchecked=True)
+        self.assertEqual(second['status'], '已导出')
+        self.assertNotEqual(first['output'], second['output'])
+        self.assertEqual(Path(second['output']).read_bytes(), changed)
+
+    def test_same_content_with_changed_identity_reuses_verified_export(self):
+        source, first = self.run_source(self.make_zip())
+        saved = source.stat()
+        os.utime(source, ns=(saved.st_atime_ns, saved.st_mtime_ns + 1000000000))
+        second = core.process(source, {}, self.out)
+        self.assertEqual(second['status'], '已处理过')
+        self.assertEqual(first['output'], second['output'])
+        self.assertFalse(list(self.out.rglob('*.处理中')))
+
+    def test_checksum_change_cannot_reuse_existing_zip(self):
+        source, first = self.run_source(self.make_zip())
+        self.assertEqual(first['status'], '已导出')
+        second = core.process(source, {'md5': 'f' * 32}, self.out)
+        self.assertEqual(second['status'], '需要检查')
+        self.assertFalse(second['output'])
+
     def test_matching_size_does_not_bypass_hash(self):
         _, result = self.run_source(b'bad', record={'file_size': 3, 'md5': hashlib.md5(b'abc').hexdigest()})
         self.assertEqual(result['status'], '需要检查')
@@ -92,6 +207,43 @@ class FinisherTests(unittest.TestCase):
         (self.out / '处理记录.json').write_text('{', encoding='utf-8')
         _, result = self.run_source(self.make_zip())
         self.assertEqual(result['status'], '已导出')
+
+    def test_malformed_history_entries_are_ignored(self):
+        source, first = self.run_source(self.make_zip())
+        history = self.out / '处理记录.json'
+        valid = json.loads(history.read_text(encoding='utf-8'))[0]
+        for changes in ({'output': None}, {'export_size': 'bad'}, {'export_mtime': []},
+                        {'detail': None}, {'identity': []}, {'sha256': None}, {'name': 3}):
+            with self.subTest(changes=changes):
+                malformed = dict(valid, **changes)
+                history.write_text(json.dumps([None, 'bad', 1, {}, malformed, valid]), encoding='utf-8')
+                result = core.process(source, {}, self.out)
+                self.assertEqual(result['status'], '已处理过')
+                self.assertEqual(result['output'], first['output'])
+
+    def test_malformed_history_does_not_prevent_new_export(self):
+        self.out.mkdir()
+        history = self.out / '处理记录.json'
+        history.write_text('[null, "bad", {}, {"identity": {}}]', encoding='utf-8')
+        _, result = self.run_source(self.make_zip())
+        self.assertEqual(result['status'], '已导出')
+        saved = json.loads(history.read_text(encoding='utf-8'))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]['output'], result['output'])
+
+    def test_history_write_failure_preserves_export_success(self):
+        original_write = Path.write_text
+        def write(path, *args, **kwargs):
+            if path.name == '处理记录.json':
+                raise PermissionError('history write denied')
+            return original_write(path, *args, **kwargs)
+        with patch.object(Path, 'write_text', write):
+            source, result = self.run_source(self.make_zip())
+        self.assertEqual(result['status'], '已导出')
+        self.assertEqual(Path(result['output']).read_bytes(), source.read_bytes())
+        self.assertEqual(result['sha256'], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertIn('处理记录保存失败', result['detail'])
+        self.assertFalse(list(self.out.rglob('*.处理中')))
 
     def test_disabled_encrypted_export_requires_choice(self):
         data = bytearray(self.make_zip())

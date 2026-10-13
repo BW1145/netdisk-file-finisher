@@ -148,13 +148,23 @@ def hash_stream(stream, length, algorithm, cancel, notify, label):
     return digest.hexdigest()
 
 
-def copy_snapshot(source, prefix, partial, cancel, notify):
+def copy_snapshot(source, prefix, partial, cancel, notify, expected_md5=None):
     with shared_reader(source) as stream:
         total = os.fstat(stream.fileno()).st_size - prefix
         if total < 0:
             raise ValueError('源文件长度不足。')
         if shutil.disk_usage(partial.parent).free < total:
             raise OSError('保存位置空间不足。')
+        md5 = hashlib.md5() if expected_md5 else None
+        if md5 is not None:
+            remaining = prefix
+            while remaining:
+                check_stop(cancel)
+                block = stream.read(min(CHUNK, remaining))
+                if not block:
+                    raise ValueError('源文件长度不足。')
+                md5.update(block)
+                remaining -= len(block)
         stream.seek(prefix)
         digest = hashlib.sha256()
         done = 0
@@ -166,10 +176,14 @@ def copy_snapshot(source, prefix, partial, cancel, notify):
                     raise ValueError('源文件还在变化，请稍后重试。')
                 output.write(block)
                 digest.update(block)
+                if md5 is not None:
+                    md5.update(block)
                 done += len(block)
                 notify('复制文件', int(done * 100 / total))
             output.flush()
             os.fsync(output.fileno())
+        if md5 is not None and md5.hexdigest() != expected_md5:
+            raise ValueError('完整文件校验值不一致。可使用“导出待核查副本”。')
         stream.seek(prefix)
         current = hash_stream(stream, total, 'sha256', cancel, notify, '核对源文件')
         if current != digest.hexdigest():
@@ -271,6 +285,28 @@ def validate_other_archive(path, cancel, notify):
                 proc.wait(timeout=10)
 
 
+def read_history(path):
+    fields = {'identity': dict, 'name': str, 'output': str, 'detail': str,
+              'sha256': str, 'export_size': int, 'export_mtime': int}
+    return [item for item in read_json(path, [])
+            if isinstance(item, dict)
+            and all(isinstance(item.get(key), kind) for key, kind in fields.items())
+            and item['output'] and item['export_size'] >= 0
+            and re.fullmatch(r'[0-9a-f]{64}', item['sha256'])]
+
+
+def verified_export(old, sha, cancel, notify):
+    target = Path(old['output'])
+    try:
+        stat = target.stat()
+        if not target.is_file() or stat.st_size != old['export_size'] or stat.st_mtime_ns != old['export_mtime']:
+            return False
+        with shared_reader(target) as stream:
+            return hash_stream(stream, stat.st_size, 'sha256', cancel, notify, '核对已有副本') == sha
+    except (OSError, ValueError):
+        return False
+
+
 def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
             encrypted_ok=True, unchecked=False):
     source, output_folder = Path(source), Path(output_folder)
@@ -283,12 +319,12 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
         with shared_reader(source) as stream:
             layout = inspect(stream)
         result['kind'] = layout['kind']
-        if record.get('status') == 2 and layout['kind'] != 'ZIP' and not unchecked:
+        if record.get('status') == 2 and not unchecked:
             result.update(status='等待下载停止', detail='网盘仍在下载该文件。停止或报错后再运行。')
             return result
         if (record.get('file_size') and record.get('complete_size') is not None
                 and record['complete_size'] < record['file_size']
-                and record.get('error_code') != 1000022 and layout['kind'] != 'ZIP' and not unchecked):
+                and record.get('error_code') != 1000022 and not unchecked):
             result.update(status='等待下载完成', detail='网盘记录显示尚未下载完整；收尾报错任务可另行检查。')
             return result
         if record.get('file_size') and source_stat.st_size != record['file_size'] and not unchecked:
@@ -300,7 +336,7 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
                     'mtime': source_stat.st_mtime_ns, 'unchecked': unchecked,
                     'md5': record.get('md5', ''), 'prefix': layout['prefix']}
         expected = normalized_md5(record.get('md5'))
-        if layout['kind'] == '普通文件' and not unchecked:
+        if not unchecked and (layout['kind'] == '普通文件' or (layout['kind'] == 'ZIP' and expected)):
             if not expected:
                 raise ValueError('没有可用校验值。可使用“导出待核查副本”。')
             with shared_reader(source) as stream:
@@ -309,12 +345,14 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
             if not matched:
                 raise ValueError('完整文件校验值不一致。可使用“导出待核查副本”。')
         records_file = output_folder / '处理记录.json'
-        previous = read_json(records_file, [])
+        previous = read_history(records_file)
         for old in previous:
-            if old.get('identity') == identity:
-                target = Path(old['output'])
-                if target.is_file() and target.stat().st_size == old['export_size'] and target.stat().st_mtime_ns == old['export_mtime']:
-                    result.update(status='已处理过', output=str(target), detail=old['detail'])
+            if old['identity'] == identity and old['export_size'] == source_stat.st_size - layout['prefix']:
+                with shared_reader(source) as stream:
+                    stream.seek(layout['prefix'])
+                    current = hash_stream(stream, old['export_size'], 'sha256', cancel, notify, '核对源文件')
+                if current == old['sha256'] and verified_export(old, current, cancel, notify):
+                    result.update(status='已处理过', output=old['output'], detail=old['detail'])
                     return result
         output_folder.mkdir(parents=True, exist_ok=True)
         target_name = str(Path(name).with_suffix(layout['ext'])) if layout['ext'] else name
@@ -328,14 +366,14 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
         with tempfile.NamedTemporaryFile(prefix='.' + target.stem + '-', suffix='.处理中',
                                          dir=target_folder, delete=False) as temporary:
             partial = Path(temporary.name)
-        sha = copy_snapshot(source, layout['prefix'], partial, cancel, notify)
+        sha = copy_snapshot(source, layout['prefix'], partial, cancel, notify,
+                            expected_md5=expected if layout['kind'] == 'ZIP' and not unchecked else None)
         for old in previous:
             if old.get('sha256') == sha and old.get('name') == name and old.get('identity', {}).get('unchecked') == unchecked:
-                target_existing = Path(old['output'])
-                if target_existing.is_file() and target_existing.stat().st_size == old['export_size'] and target_existing.stat().st_mtime_ns == old['export_mtime']:
+                if verified_export(old, sha, cancel, notify):
                     partial.unlink()
                     partial = None
-                    result.update(status='已处理过', output=str(target_existing), detail=old['detail'])
+                    result.update(status='已处理过', output=old['output'], detail=old['detail'])
                     return result
         if unchecked:
             detail = '副本与源数据一致；内容完整性未验证'
@@ -367,7 +405,10 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
                       identity=identity, export_size=target.stat().st_size,
                       export_mtime=target.stat().st_mtime_ns)
         previous.append(result)
-        records_file.write_text(json.dumps(previous, ensure_ascii=False, indent=2), encoding='utf-8')
+        try:
+            records_file.write_text(json.dumps(previous, ensure_ascii=False, indent=2), encoding='utf-8')
+        except OSError as error:
+            result['detail'] += f'；处理记录保存失败：{error}。副本已导出，下次处理可能再次导出。'
         return result
     except Stopped:
         result.update(status='已停止', detail='操作已停止，原文件保留。')
