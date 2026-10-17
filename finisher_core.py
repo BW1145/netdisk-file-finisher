@@ -2,12 +2,14 @@ import ctypes
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import zipfile
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -135,6 +137,7 @@ def inspect(stream):
 
 
 def hash_stream(stream, length, algorithm, cancel, notify, label):
+    expected_end = stream.tell() + length
     digest = hashlib.new(algorithm)
     done = 0
     while done < length:
@@ -145,6 +148,8 @@ def hash_stream(stream, length, algorithm, cancel, notify, label):
         digest.update(block)
         done += len(block)
         notify(label, int(done * 100 / length))
+    if stream.read(1) or os.fstat(stream.fileno()).st_size != expected_end:
+        raise ValueError('读取时文件长度发生变化，请稍后重试。')
     return digest.hexdigest()
 
 
@@ -184,14 +189,19 @@ def copy_snapshot(source, prefix, partial, cancel, notify, expected_md5=None):
             os.fsync(output.fileno())
         if md5 is not None and md5.hexdigest() != expected_md5:
             raise ValueError('完整文件校验值不一致。可使用“导出待核查副本”。')
+        with partial.open('rb') as copied:
+            current = hash_stream(copied, total, 'sha256', cancel, notify, '核对导出副本')
+        if current != digest.hexdigest():
+            raise ValueError('副本数据校验未通过。')
+        if md5 is not None and prefix:
+            stream.seek(0)
+            current = hash_stream(stream, total + prefix, 'md5', cancel, notify, '核对网盘校验值')
+            if current != expected_md5:
+                raise ValueError('源内容在复制期间发生了变化，请稍后重试。')
         stream.seek(prefix)
         current = hash_stream(stream, total, 'sha256', cancel, notify, '核对源文件')
         if current != digest.hexdigest():
             raise ValueError('源内容在复制期间发生了变化，请稍后重试。')
-    with partial.open('rb') as copied:
-        current = hash_stream(copied, total, 'sha256', cancel, notify, '核对导出副本')
-    if current != digest.hexdigest():
-        raise ValueError('副本数据校验未通过。')
     return digest.hexdigest()
 
 
@@ -217,16 +227,39 @@ def validate_media(path, cancel, notify):
                                  '-progress', 'pipe:1', '-nostats', '-f', 'null', os.devnull],
                                 stdout=subprocess.PIPE, stderr=errors, text=True,
                                 encoding='utf-8', errors='replace', creationflags=HIDDEN_PROCESS)
+        lines = queue.Queue()
+
+        def read_progress():
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        reader = threading.Thread(target=read_progress, daemon=True)
+        reader.start()
         try:
-            for line in proc.stdout:
+            while True:
                 check_stop(cancel)
+                try:
+                    line = lines.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
                 if line.startswith('out_time_us='):
                     value = line.partition('=')[2].strip()
                     if value.lstrip('-').isdigit():
                         seconds = max(0, int(value) // 1000000)
                         notify(f'检查音视频：已读取 {seconds // 60} 分 {seconds % 60} 秒', None)
+            while proc.poll() is None:
+                check_stop(cancel)
+                try:
+                    proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
             check_stop(cancel)
-            code = proc.wait()
+            code = proc.returncode
             errors.seek(0)
             detail = errors.read(3000).decode('utf-8', errors='replace').strip()
             if code or detail:
@@ -234,7 +267,12 @@ def validate_media(path, cancel, notify):
         finally:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=10)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            reader.join()
             proc.stdout.close()
 
 
@@ -333,7 +371,12 @@ def process(source, record, output_folder, cancel=None, notify=lambda *_: None,
         check_stop(cancel)
         source_stat = source.stat()
         with shared_reader(source) as stream:
-            layout = inspect(stream)
+            try:
+                layout = inspect(stream)
+            except (ValueError, zipfile.BadZipFile):
+                if not unchecked:
+                    raise
+                layout = {'kind': '普通文件', 'ext': None, 'prefix': 0}
         result['kind'] = layout['kind']
         if record.get('status') == 2 and not unchecked:
             result.update(status='等待下载停止', detail='网盘仍在下载该文件。停止或报错后再运行。')

@@ -5,12 +5,14 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import finisher_core as core
 
@@ -386,6 +388,152 @@ class FinisherTests(unittest.TestCase):
                 writer.write(b'xyz')
             reader.seek(0)
             self.assertEqual(reader.read(), b'xyz')
+
+    def test_source_growth_during_export_is_rejected(self):
+        for phase in ('核对网盘校验值', '复制文件', '核对源文件', '核对导出副本'):
+            with self.subTest(phase=phase):
+                data = b'cover' + self.make_zip()
+                source = self.root / (phase + '.downloading')
+                source.write_bytes(data)
+                grown = []
+
+                def update(label, percent):
+                    if label == phase and not grown:
+                        with source.open('ab') as writer:
+                            writer.write(b'new download data')
+                        grown.append(True)
+
+                result = core.process(source, {'md5': hashlib.md5(data).hexdigest()},
+                                      self.out, notify=update)
+                self.assertTrue(grown)
+                self.assertEqual(result['status'], '需要检查')
+                self.assertIn('变化', result['detail'])
+                self.assertFalse(result['output'])
+                self.assertEqual(source.read_bytes(), data + b'new download data')
+                self.assertFalse(list(self.out.rglob('*.zip')))
+                self.assertFalse(list(self.out.rglob('*.处理中')))
+
+    def test_source_growth_during_reuse_is_rejected(self):
+        source, first = self.run_source(self.make_zip())
+        original = Path(first['output']).read_bytes()
+        grown = []
+
+        def update(label, percent):
+            if label == '核对源文件' and not grown:
+                with source.open('ab') as writer:
+                    writer.write(b'new data')
+                grown.append(True)
+
+        result = core.process(source, {}, self.out, notify=update)
+        self.assertTrue(grown)
+        self.assertEqual(result['status'], '需要检查')
+        self.assertFalse(result['output'])
+        self.assertEqual(Path(first['output']).read_bytes(), original)
+
+    def test_final_source_content_is_rechecked(self):
+        for position in (0, len(b'cover') + 35):
+            with self.subTest(position=position):
+                data = b'cover' + self.make_zip()
+                source = self.root / ('changed-' + str(position) + '.downloading')
+                source.write_bytes(data)
+                changed = []
+
+                def update(label, percent):
+                    if label == '核对导出副本' and not changed:
+                        with source.open('r+b') as writer:
+                            writer.seek(position)
+                            writer.write(b'X')
+                        changed.append(True)
+
+                result = core.process(source, {'md5': hashlib.md5(data).hexdigest()},
+                                      self.out, notify=update)
+                self.assertTrue(changed)
+                self.assertEqual(result['status'], '需要检查')
+                self.assertIn('变化', result['detail'])
+                self.assertFalse(result['output'])
+                self.assertFalse(list(self.out.rglob('*.zip')))
+                self.assertFalse(list(self.out.rglob('*.处理中')))
+
+    def test_hash_rejects_trailing_bytes_even_for_empty_snapshot(self):
+        source = self.root / 'hash-source'
+        source.write_bytes(b'abc')
+        for length in (0, 2):
+            with self.subTest(length=length), core.shared_reader(source) as stream:
+                with self.assertRaisesRegex(ValueError, '变化'):
+                    core.hash_stream(stream, length, 'sha256', None, lambda *_: None, 'hash')
+
+    def test_malformed_zip_manual_rescue_preserves_original_bytes(self):
+        for header in (b'PK\x01\x02', b'PK\x03\x04'):
+            with self.subTest(header=header):
+                damaged = bytearray(b'cover' + self.make_zip())
+                damaged[damaged.index(header)] = 0
+                source, verified = self.run_source(damaged, name='damaged.zip.downloading')
+                self.assertEqual(verified['status'], '需要检查')
+                self.assertFalse(verified['output'])
+                rescued = core.process(source, {}, self.out, unchecked=True)
+                self.assertEqual(rescued['status'], '已导出')
+                self.assertIn('未验证', rescued['detail'])
+                self.assertEqual(Path(rescued['output']).parent.name, '待核查副本')
+                self.assertEqual(Path(rescued['output']).read_bytes(), damaged)
+
+    def test_silent_media_process_can_be_cancelled(self):
+        for output in ('', "print('out_time_us=', end='', flush=True); ",
+                       'os.close(1); '):
+            with self.subTest(output=output):
+                self.check_media_cancellation(output)
+
+    def check_media_cancellation(self, output):
+        cancel = threading.Event()
+        real_popen = subprocess.Popen
+        children = []
+
+        def start(*args, **kwargs):
+            script = 'import os, time; ' + output + 'time.sleep(30)'
+            child = real_popen([sys.executable, '-c', script], **kwargs)
+            children.append(child)
+            return child
+
+        timer = threading.Timer(0.3, cancel.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with patch.object(core, 'find_ffmpeg', return_value='ffmpeg'), \
+                    patch.object(core.subprocess, 'Popen', side_effect=start):
+                source, result = self.run_source(b'\0\0\0\x18ftypisom' + b'x' * 64,
+                                                 cancel=cancel)
+            elapsed = time.monotonic() - started
+            self.assertEqual(result['status'], '已停止')
+            self.assertLess(elapsed, 5)
+            self.assertIsNotNone(children[0].poll())
+            self.assertTrue(children[0].stdout.closed)
+            self.assertTrue(source.exists())
+            self.assertFalse(list(self.out.rglob('*.处理中')))
+            self.assertFalse(list(self.out.rglob('*.mp4')))
+        finally:
+            timer.cancel()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_media_cancellation_kills_process_after_terminate_timeout(self):
+        cancel = threading.Event()
+        child = Mock()
+        child.stdout = io.StringIO('out_time_us=1000000\n')
+        child.poll.return_value = None
+        child.wait.side_effect = [subprocess.TimeoutExpired('ffmpeg', 2), 0]
+
+        def update(*_):
+            cancel.set()
+
+        with patch.object(core, 'find_ffmpeg', return_value='ffmpeg'), \
+                patch.object(core.subprocess, 'Popen', return_value=child):
+            with self.assertRaises(core.Stopped):
+                core.validate_media(self.root / 'media', cancel, update)
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.wait.call_count, 2)
+        self.assertTrue(child.stdout.closed)
 
     def test_preallocated_active_task_waits(self):
         _, result = self.run_source(b'\0' * 100, record={'status': 2, 'file_size': 100, 'complete_size': 1})
