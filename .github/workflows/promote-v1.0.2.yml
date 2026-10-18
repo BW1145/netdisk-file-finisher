@@ -1,0 +1,111 @@
+name: Publish tested v1.0.2
+on:
+  push:
+    branches: ['release/v1.0.2']
+permissions:
+  contents: read
+concurrency:
+  group: publish-v1.0.2
+  cancel-in-progress: false
+jobs:
+  promote:
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_COMMIT: f4dee8f487813319548ffc648e4a6e717fc3a9d9
+      SOURCE_RUN: '39059354190'
+      RELEASE_TAG: v1.0.2
+      EXPECTED_EXE_SHA256: 2886fcc5f89a978e2b7c8e3d64609edcb4c79e6bc2d0208079152249546761e5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: f4dee8f487813319548ffc648e4a6e717fc3a9d9
+          fetch-depth: 0
+      - name: Verify successful source run and download tested build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $run = gh api "repos/$env:GH_REPO/actions/runs/$env:SOURCE_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:SOURCE_COMMIT -or $run.conclusion -ne 'success' -or $run.path -ne '.github/workflows/windows.yml') { throw 'Source build does not match the reviewed successful run.' }
+          $artifact = gh api "repos/$env:GH_REPO/actions/artifacts/12110478433" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $artifact.workflow_run.id -ne [long]$env:SOURCE_RUN -or $artifact.expired -or $artifact.name -ne 'NetdiskFinisher-Windows-x64' -or $artifact.digest -ne 'sha256:69cbbad5b33271dec1df8fd638142f74acfd78664b0df381420700718238dd7a') { throw 'Source artifact identity or digest does not match.' }
+          gh run download $env:SOURCE_RUN --name NetdiskFinisher-Windows-x64 --dir tested
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download tested build.' }
+          foreach ($line in Get-Content tested/SHA256SUMS.txt) {
+            if ($line -notmatch '^([0-9a-f]{64})  ([^/\\]+)$') { throw 'Invalid source checksum entry.' }
+            $expected = $Matches[1]; $name = $Matches[2]
+            if ((Get-FileHash -LiteralPath "tested/$name" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "Checksum mismatch: $name" }
+          }
+          $info = Get-Content tested/BUILD_INFO.json -Encoding utf8 | ConvertFrom-Json
+          $hash = (Get-FileHash tested/NetdiskFinisher.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($info.commit -ne $env:SOURCE_COMMIT -or $info.version -ne 'dev-f4dee8f48781' -or $info.exe_sha256 -ne $hash -or $hash -ne $env:EXPECTED_EXE_SHA256) { throw 'Source build metadata mismatch.' }
+          New-Item -ItemType Directory dist -Force | Out-Null
+          Copy-Item tested/NetdiskFinisher.exe dist/NetdiskFinisher.exe
+      - name: Check original packaged GUI
+        shell: pwsh
+        run: |
+          $task = Start-Process ./dist/NetdiskFinisher.exe -ArgumentList '--smoke-test smoke.json' -PassThru -Wait -WindowStyle Hidden
+          if ($task.ExitCode -ne 0) { throw 'GUI check failed.' }
+          $report = Get-Content smoke.json -Encoding utf8 | ConvertFrom-Json
+          if (!$report.widgets_ready) { throw 'GUI widgets are unavailable.' }
+      - name: Repackage original EXE with release version
+        shell: pwsh
+        run: |
+          ./package-release.ps1 -Version $env:RELEASE_TAG -Commit $env:SOURCE_COMMIT
+          Expand-Archive "dist/release/NetdiskFinisher-$env:RELEASE_TAG-Windows-x64.zip" -DestinationPath verify
+          $inside = Get-Content verify/BUILD_INFO.json -Encoding utf8 | ConvertFrom-Json
+          $outside = Get-Content dist/release/BUILD_INFO.json -Encoding utf8 | ConvertFrom-Json
+          foreach ($info in @($inside, $outside)) {
+            if ($info.version -ne $env:RELEASE_TAG -or $info.commit -ne $env:SOURCE_COMMIT -or $info.exe_sha256 -ne $env:EXPECTED_EXE_SHA256) { throw 'Release metadata mismatch.' }
+          }
+          if ((Get-FileHash verify/NetdiskFinisher.exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_EXE_SHA256) { throw 'ZIP executable changed.' }
+          foreach ($line in Get-Content dist/release/SHA256SUMS.txt) {
+            if ($line -notmatch '^([0-9a-f]{64})  ([^/\\]+)$') { throw 'Invalid release checksum entry.' }
+            $expected = $Matches[1]; $name = $Matches[2]
+            if ((Get-FileHash -LiteralPath "dist/release/$name" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw "Release checksum mismatch: $name" }
+          }
+      - name: Tag reviewed source and prepare draft release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          修复文件导出一致性与音视频检查取消问题。
+          
+          - 检查导出及复用期间的文件增长、长度变化和内容变化，发现异常时保留源文件并清理临时副本。
+          - 重新核对导出副本与源文件的 SHA-256；带前缀 ZIP 额外核对完整源文件的网盘校验值。
+          - FFmpeg 检查使用独立读取线程和定时轮询，静默、输出不完整或提前关闭输出时也能取消；必要时强制结束进程。
+          - 损坏 ZIP 可通过“导出待核查副本”保留原始数据，继续明确标注未验证。
+          
+          下载 NetdiskFinisher-v1.0.2-Windows-x64.zip，解压后运行 NetdiskFinisher.exe。需要完整视频检查时，将 FFmpeg 安装到系统或放在程序旁边。
+          
+          验证：43 项本机回归测试全部通过（含真实 FFmpeg 完整/截断视频）；原 Windows 构建 41 项通过、2 项因缺少 FFmpeg 跳过，打包 GUI 自检通过。发布复用 Windows Actions #39059354190 的原始 EXE，并重新生成正式版本 ZIP、BUILD_INFO.json 与 SHA256SUMS.txt。
+          源码提交：f4dee8f487813319548ffc648e4a6e717fc3a9d9。
+          '@ | Set-Content release-notes.md -Encoding utf8
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a $env:RELEASE_TAG $env:SOURCE_COMMIT -F release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create new release tag.' }
+          git push origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not push release tag.' }
+          $assets = Get-ChildItem dist/release -File | ForEach-Object { $_.FullName }
+          gh release create $env:RELEASE_TAG @assets --draft --verify-tag --title "网盘文件收尾 $env:RELEASE_TAG" --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release preparation failed.' }
+      - name: Verify uploaded assets and publish
+        shell: pwsh
+        run: |
+          $release = gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$release.draft -or $release.assets.Count -ne 4) { throw 'Draft release assets missing.' }
+          foreach ($asset in $release.assets) {
+            $local = Get-Item -LiteralPath "dist/release/$($asset.name)"
+            $hash = (Get-FileHash $local.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($asset.state -ne 'uploaded' -or $asset.size -ne $local.Length -or $asset.digest -ne "sha256:$hash") { throw "Uploaded asset mismatch: $($asset.name)" }
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
+          $release = gh api "repos/$env:GH_REPO/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.draft -or $release.prerelease -or !$release.published_at) { throw 'Release is not publicly published.' }
+          $release | ConvertTo-Json -Depth 10
