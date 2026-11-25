@@ -1,6 +1,7 @@
 import ctypes
 import os
 import subprocess
+from collections import deque
 from ctypes import wintypes
 
 import pythoncom
@@ -66,15 +67,15 @@ def accept_drop(root, callback):
     controls.RemoveWindowSubclass.argtypes = [wintypes.HWND, procedure, pointer]
     controls.DefSubclassProc.argtypes = [wintypes.HWND, wintypes.UINT, pointer, ctypes.c_ssize_t]
     controls.DefSubclassProc.restype = ctypes.c_ssize_t
+    pending = deque()
 
     @procedure
     def receive(hwnd, msg, wparam, lparam, subclass, data):
         if msg != WM_DROPFILES:
             return controls.DefSubclassProc(hwnd, msg, wparam, lparam)
         try:
-            paths = [shell.DragQueryFileW(wparam, i)
-                     for i in range(shell.DragQueryFileW(wparam, -1))]
-            root.after_idle(callback, paths)
+            pending.extend(shell.DragQueryFileW(wparam, i)
+                           for i in range(shell.DragQueryFileW(wparam, -1)))
         finally:
             shell32.DragFinish(wparam)
         return 0
@@ -84,7 +85,18 @@ def accept_drop(root, callback):
     shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
     shell32.DragAcceptFiles(window, True)
 
+    def dispatch():
+        nonlocal timer
+        if pending:
+            paths = list(pending)
+            pending.clear()
+            callback(paths)
+        timer = root.after(60, dispatch)
+
+    timer = root.after(60, dispatch)
+
     def close():
+        root.after_cancel(timer)
         shell32.DragAcceptFiles(window, False)
         controls.RemoveWindowSubclass(window, receive, 1)
 

@@ -1,18 +1,23 @@
+import ctypes
 import os
 import queue
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import tkinter as tk
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from app import handle_file
+from app import App, handle_file
 from archive_flow import Journal, STAGE_PREFIX, engine_path
 from folder_watch import FolderWatch
+from windows_io import WM_DROPFILES
+import win32gui
 
 
 def make_zip(path, files):
@@ -164,6 +169,42 @@ class WatchTests(unittest.TestCase):
             finally:
                 stop.set()
                 thread.join(5)
+
+
+@unittest.skipUnless(os.name == 'nt', 'native Windows drag and drop')
+class DropTests(unittest.TestCase):
+    def test_main_window_drop_extracts_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            archive = folder / '封面.png'
+            make_zip(archive, {'成品.txt': b'file'})
+            window = tk.Tk()
+            application = App(window, folder / 'settings.json', Journal(folder / 'state'))
+            target = ctypes.windll.user32.GetAncestor(window.winfo_id(), 2)
+            kernel = ctypes.windll.kernel32
+            kernel.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            kernel.GlobalAlloc.restype = ctypes.c_void_p
+            kernel.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel.GlobalLock.restype = ctypes.c_void_p
+            kernel.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            data = struct.pack('<IiiII', 20, 10, 10, 0, 1) + (str(archive) + '\0\0').encode('utf-16-le')
+            drop = kernel.GlobalAlloc(0x42, len(data))
+            self.assertTrue(drop)
+            ctypes.memmove(kernel.GlobalLock(drop), data, len(data))
+            kernel.GlobalUnlock(drop)
+            win32gui.PostMessage(target, WM_DROPFILES, drop, 0)
+            end = time.monotonic() + 8
+            output = folder / '成品.txt'
+            try:
+                with patch('app.reveal'):
+                    while time.monotonic() < end:
+                        window.update()
+                        if output.exists() and application.current is None:
+                            break
+                        time.sleep(.03)
+                self.assertEqual(output.read_bytes(), b'file')
+            finally:
+                application.destroy()
 
 
 if __name__ == '__main__':
