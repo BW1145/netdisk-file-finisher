@@ -1,9 +1,11 @@
 import ctypes
+import gc
 import os
 import queue
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -174,11 +176,19 @@ class WatchTests(unittest.TestCase):
 @unittest.skipUnless(os.name == 'nt', 'native Windows drag and drop')
 class DropTests(unittest.TestCase):
     def test_main_window_drop_extracts_file(self):
+        if os.environ.get('NETDISK_TEST_NATIVE_DROP') != '1':
+            child = subprocess.run([sys.executable, '-X', 'utf8', '-m', 'unittest',
+                                    'test_v110.DropTests'],
+                                   cwd=Path(__file__).parent, capture_output=True,
+                                   env=dict(os.environ, NETDISK_TEST_NATIVE_DROP='1'), timeout=20)
+            self.assertEqual(child.returncode, 0, child.stderr.decode('utf-8', 'replace'))
+            return
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
             archive = folder / '封面.png'
             make_zip(archive, {'成品.txt': b'file'})
             window = tk.Tk()
+            window.withdraw()
             application = App(window, folder / 'settings.json', Journal(folder / 'state'))
             target = ctypes.windll.user32.GetAncestor(window.winfo_id(), 2)
             kernel = ctypes.windll.kernel32
@@ -205,6 +215,8 @@ class DropTests(unittest.TestCase):
                 self.assertEqual(output.read_bytes(), b'file')
             finally:
                 application.destroy()
+                del application, window
+                gc.collect()
 
 
 if __name__ == '__main__':
