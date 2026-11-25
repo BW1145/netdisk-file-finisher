@@ -11,6 +11,7 @@ dist/
 导出文件/
 待核查副本/
 ffmpeg.exe
+7zip/
 *.mp4
 *.mkv
 *.zip

@@ -16,7 +16,12 @@ jobs:
         with:
           python-version: '3.12'
       - name: Test
-        run: python -X utf8 -m unittest -v test_finisher
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed.' }
+          ./prepare-7zip.ps1
+          python -X utf8 -m unittest -v
       - name: Build
         shell: pwsh
         run: ./build.ps1
@@ -26,7 +31,9 @@ jobs:
           $task = Start-Process ./dist/NetdiskFinisher.exe -ArgumentList '--smoke-test smoke.json' -PassThru -Wait -WindowStyle Hidden
           if ($task.ExitCode -ne 0) { throw 'GUI check failed.' }
           $report = Get-Content smoke.json -Encoding utf8 | ConvertFrom-Json
-          if (!$report.widgets_ready) { throw 'GUI widgets are unavailable.' }
+          if (!$report.widgets_ready -or !$report.drag_ready -or !$report.engine_ready) {
+            throw 'GUI or bundled extractor is unavailable.'
+          }
       - name: Package and checksums
         shell: pwsh
         env:
@@ -67,5 +74,5 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $assets = Get-ChildItem release -File | ForEach-Object { $_.FullName }
-          gh release create $env:RELEASE_TAG @assets --verify-tag --title "网盘文件收尾 $env:RELEASE_TAG" --notes-from-tag
+          gh release create $env:RELEASE_TAG @assets --draft --verify-tag --title "网盘文件收尾 $env:RELEASE_TAG" --notes-from-tag
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

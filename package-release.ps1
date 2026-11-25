@@ -11,10 +11,12 @@ try {
     $package = "dist/NetdiskFinisher-$Version-Windows-x64"
     New-Item -ItemType Directory -Path $package -Force | Out-Null
     Copy-Item -LiteralPath dist/NetdiskFinisher.exe, README.md, LICENSE -Destination $package
+    Copy-Item -LiteralPath 7zip/License.txt -Destination "$package/7-Zip-License.txt"
     $info = [ordered]@{
         version = $Version
         commit = $Commit
         exe_sha256 = (Get-FileHash dist/NetdiskFinisher.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+        seven_zip_version = '26.05'
     } | ConvertTo-Json
     $info | Set-Content -LiteralPath "$package/BUILD_INFO.json" -Encoding utf8
     New-Item -ItemType Directory -Path dist/release -Force | Out-Null
